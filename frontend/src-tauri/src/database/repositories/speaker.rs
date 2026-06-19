@@ -161,3 +161,172 @@ impl SpeakerRepository {
         Ok(voiceprint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE speaker_profiles (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                color TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE speaker_voiceprints (
+                id TEXT PRIMARY KEY,
+                speaker_profile_id TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 1,
+                total_duration REAL NOT NULL DEFAULT 0,
+                source_meeting_id TEXT,
+                source_cluster_label TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn create_profile_trims_name_and_is_listed() {
+        let pool = test_pool().await;
+        let created = SpeakerRepository::create_profile(&pool, "  Alice  ", Some("#ff0000"))
+            .await
+            .unwrap();
+        assert_eq!(created.display_name, "Alice");
+        assert_eq!(created.color.as_deref(), Some("#ff0000"));
+        assert!(created.id.starts_with("speaker-profile-"));
+        assert!(created.archived_at.is_none());
+
+        let all = SpeakerRepository::list_profiles(&pool).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].display_name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn list_profiles_excludes_archived_and_sorts_by_name() {
+        let pool = test_pool().await;
+        SpeakerRepository::create_profile(&pool, "Bob", None).await.unwrap();
+        SpeakerRepository::create_profile(&pool, "Alice", None).await.unwrap();
+        let carol = SpeakerRepository::create_profile(&pool, "Carol", None).await.unwrap();
+        sqlx::query("UPDATE speaker_profiles SET archived_at = '2026-06-04T00:00:00Z' WHERE id = ?")
+            .bind(&carol.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = SpeakerRepository::list_profiles(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.display_name)
+            .collect();
+        // Alphabetical order, archived Carol excluded.
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn rename_profile_trims_updates_and_returns_profile() {
+        let pool = test_pool().await;
+        let p = SpeakerRepository::create_profile(&pool, "Alice", None)
+            .await
+            .unwrap();
+        let renamed = SpeakerRepository::rename_profile(&pool, &p.id, "  Alicia ")
+            .await
+            .unwrap()
+            .expect("rename should return the updated profile");
+        assert_eq!(renamed.display_name, "Alicia");
+        assert!(renamed.updated_at >= p.updated_at);
+    }
+
+    #[tokio::test]
+    async fn rename_missing_profile_returns_none() {
+        let pool = test_pool().await;
+        let result = SpeakerRepository::rename_profile(&pool, "does-not-exist", "X")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_archived_profile_returns_none() {
+        let pool = test_pool().await;
+        let p = SpeakerRepository::create_profile(&pool, "Alice", None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE speaker_profiles SET archived_at = '2026-06-04T00:00:00Z' WHERE id = ?")
+            .bind(&p.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let result = SpeakerRepository::rename_profile(&pool, &p.id, "Alicia")
+            .await
+            .unwrap();
+        assert!(result.is_none(), "archived profiles must not be renamable");
+    }
+
+    #[tokio::test]
+    async fn upsert_voiceprint_updates_in_place_for_same_model() {
+        let pool = test_pool().await;
+        let p = SpeakerRepository::create_profile(&pool, "Alice", None)
+            .await
+            .unwrap();
+
+        let first = SpeakerRepository::upsert_voiceprint(
+            &pool, &p.id, "ecapa", vec![1, 2, 3], 2, 4.0, Some("m1"), Some("SPEAKER_00"),
+        )
+        .await
+        .unwrap();
+        let second = SpeakerRepository::upsert_voiceprint(
+            &pool, &p.id, "ecapa", vec![9, 9, 9], 5, 12.5, Some("m2"), Some("SPEAKER_01"),
+        )
+        .await
+        .unwrap();
+
+        // Same row reused (id preserved), values replaced.
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.embedding, vec![9, 9, 9]);
+        assert_eq!(second.sample_count, 5);
+        assert_eq!(second.total_duration, 12.5);
+
+        let all = SpeakerRepository::list_voiceprints(&pool).await.unwrap();
+        assert_eq!(all.len(), 1, "same profile+model must not create a duplicate row");
+        assert_eq!(all[0].embedding, vec![9, 9, 9]);
+    }
+
+    #[tokio::test]
+    async fn upsert_voiceprint_keeps_separate_rows_per_model() {
+        let pool = test_pool().await;
+        let p = SpeakerRepository::create_profile(&pool, "Alice", None)
+            .await
+            .unwrap();
+        SpeakerRepository::upsert_voiceprint(&pool, &p.id, "ecapa", vec![1], 1, 1.0, None, None)
+            .await
+            .unwrap();
+        SpeakerRepository::upsert_voiceprint(&pool, &p.id, "wespeaker", vec![2], 1, 1.0, None, None)
+            .await
+            .unwrap();
+
+        let all = SpeakerRepository::list_voiceprints(&pool).await.unwrap();
+        assert_eq!(all.len(), 2, "different embedding models are distinct voiceprints");
+    }
+}
