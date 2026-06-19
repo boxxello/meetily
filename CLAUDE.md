@@ -8,14 +8,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 1. **Frontend**: Tauri-based desktop application (Rust + Next.js + TypeScript)
 2. **Rust Backend**: Tauri commands, audio capture, transcription, storage, and summarization orchestration
-3. **Legacy Backend Archive**: the old Python/FastAPI, Docker, and standalone whisper-server backend under `backend/` is archived and unsupported
+3. **Speaker Recognition Sidecar**: `backend/diarization_service` is the active local Python sidecar for pyannote diarization, speaker embeddings, and voiceprint matching
+4. **Legacy Backend Archive**: the old Python/FastAPI, Docker, and standalone whisper-server backend under `backend/` is archived and unsupported
 
 ### Key Technology Stack
 - **Desktop App**: Tauri 2.x (Rust) + Next.js 14 + React 18
 - **Audio Processing**: Rust (cpal, whisper-rs, professional audio mixing)
 - **Transcription**: Whisper.cpp / whisper-rs and Parakeet paths in the Tauri app
 - **App API Surface**: Tauri commands and events, not a separate FastAPI service
+- **Speaker Recognition**: optional local pyannote/SpeechBrain sidecar under `backend/diarization_service`
 - **LLM Integration**: Ollama (local), Claude, Groq, OpenRouter
+
+## Fork Workflow Memory
+
+For the `boxxello/meetily` fork, keep `staging/boxxello-fork` as the local integration branch. Create feature branches from that staging branch, keep each feature independently reviewable, and merge or cherry-pick successful feature work back into staging before preparing fork PRs or release builds.
+
+Do not stack unrelated product work directly on one-off fix branches once a staging branch exists. If work starts on a temporary fix branch, land the completed commit on `staging/boxxello-fork` before starting the next feature.
+
+Speaker labeling direction for this fork: implement real person-level speaker recognition. Do not use microphone/system/stereo/channel topology as the speaker identity model. The intended model is diarization plus speaker profiles/voiceprints: assign a name to an enrolled speaker, recognize when that same person speaks again, and reconcile unknown diarized speakers to known profiles when the user confirms the identity.
 
 ## Essential Development Commands
 
@@ -46,11 +56,24 @@ pnpm run tauri:dev:vulkan   # AMD/Intel Vulkan
 pnpm run tauri:dev:cpu      # CPU-only (no GPU)
 ```
 
+### Speaker Recognition Sidecar
+
+**Location**: `/backend/diarization_service`
+
+This is an active local helper service for speaker diarization and person-level recognition. It is intentionally separate from the Rust/Tauri app because pyannote.audio and SpeechBrain are Python/PyTorch libraries. Keep it local-only, restart it after dependency or compatibility changes, and do not confuse it with the archived legacy FastAPI backend.
+
+Use this sidecar for:
+- pyannote diarization
+- speaker embedding extraction
+- matching learned voiceprints to diarized speaker clusters
+
+When validating speaker assignment behavior, inspect speaker metadata columns and counts only unless the user explicitly asks to read transcript text.
+
 ### Legacy Backend Archive
 
 **Location**: `/backend`
 
-The Python/FastAPI backend, Docker setup, and standalone whisper-server scripts are archived for historical reference and migration context only. Do not use them for current development, new installs, production deployments, or issue triage for the supported app.
+The old Python/FastAPI backend, Docker setup, and standalone whisper-server scripts are archived for historical reference and migration context only. Do not use them for current development, new installs, production deployments, or issue triage for the supported app. The active exception is `backend/diarization_service`, described above.
 
 The archived FastAPI service had unauthenticated, development-oriented CORS behavior. Treat that behavior as obsolete legacy context, not as a supported production API.
 

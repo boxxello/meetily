@@ -17,6 +17,9 @@
 # testing
 /coverage
 /dist
+/.integration-artifacts/
+/docs/superpowers/plans/
+__pycache__/
 
 # next.js
 /.next/
