@@ -3,10 +3,19 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Copy, Download, FolderOpen, RefreshCw, Loader2, Users } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
+import { toast } from 'sonner';
+import { SpeakerIdentificationResult } from '@/types';
 
 
 interface TranscriptButtonGroupProps {
@@ -16,6 +25,7 @@ interface TranscriptButtonGroupProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+  isRecording?: boolean;
 }
 
 
@@ -26,9 +36,65 @@ export function TranscriptButtonGroup({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  isRecording = false,
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isIdentifyingSpeakers, setIsIdentifyingSpeakers] = useState(false);
+
+  const handleExport = useCallback(async (format: string) => {
+    if (!meetingId) return;
+    setIsExporting(true);
+    try {
+      const result = await invoke<{ saved: boolean; path?: string; segment_count: number; skipped_count?: number }>('api_export_transcript', {
+        meetingId,
+        format,
+      });
+      if (result.saved) {
+        toast.success(`Exported as ${format.toUpperCase()}`, {
+          description: `${result.segment_count} segments saved${result.skipped_count ? ` (${result.skipped_count} skipped)` : ''}`,
+          duration: 4000,
+        });
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message !== 'Save cancelled') {
+        toast.error('Export failed', {
+          description: error instanceof Error ? error.message : String(error),
+          duration: 5000,
+        });
+      }
+    } finally {
+      setIsExporting(false);
+    }
+  }, [meetingId]);
+
+  const handleIdentifySpeakers = useCallback(async () => {
+    if (!meetingId) return;
+
+    setIsIdentifyingSpeakers(true);
+    try {
+      const result = await invoke<SpeakerIdentificationResult>('api_identify_meeting_speakers', {
+        meetingId,
+      });
+
+      if (onRefetchTranscripts) {
+        await onRefetchTranscripts();
+      }
+
+      toast.success('Speaker identification complete', {
+        description: `${result.speaker_turn_count} speaker turns processed; ${result.updated_transcript_count} transcript segments labeled`,
+        duration: 5000,
+      });
+    } catch (error) {
+      toast.error('Speaker identification failed', {
+        description: error instanceof Error ? error.message : String(error),
+        duration: 7000,
+      });
+    } finally {
+      setIsIdentifyingSpeakers(false);
+    }
+  }, [meetingId, onRefetchTranscripts]);
 
   const handleRetranscribeComplete = useCallback(async () => {
     // Refetch transcripts to show the updated data
@@ -66,6 +132,58 @@ export function TranscriptButtonGroup({
         >
           <FolderOpen className="xl:mr-2" size={18} />
           <span className="hidden lg:inline">Recording</span>
+        </Button>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={transcriptCount === 0 || isExporting}
+              title={isExporting ? 'Exporting...' : transcriptCount === 0 ? 'No transcript to export' : 'Export Transcript'}
+            >
+              {isExporting ? <Loader2 className="animate-spin" size={18} /> : <Download size={18} />}
+              <span>{isExporting ? 'Exporting...' : 'Export'}</span>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              onClick={() => {
+                Analytics.trackButtonClick('export_txt', 'meeting_details');
+                handleExport('txt');
+              }}
+            >
+              Export as TXT
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                Analytics.trackButtonClick('export_vtt', 'meeting_details');
+                handleExport('vtt');
+              }}
+            >
+              Export as VTT
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!meetingId || transcriptCount === 0 || isRecording || isIdentifyingSpeakers}
+          onClick={() => {
+            Analytics.trackButtonClick('identify_speakers', 'meeting_details');
+            handleIdentifySpeakers();
+          }}
+          title={
+            isRecording
+              ? 'Speaker identification is available after recording'
+              : transcriptCount === 0
+                ? 'No transcript to identify'
+                : 'Identify Speakers'
+          }
+        >
+          {isIdentifyingSpeakers ? <Loader2 className="animate-spin" size={18} /> : <Users size={18} />}
+          <span className="hidden xl:inline">{isIdentifyingSpeakers ? 'Identifying...' : 'Speakers'}</span>
         </Button>
 
         {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
