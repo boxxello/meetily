@@ -49,6 +49,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod speaker_sidecar;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -64,9 +65,9 @@ use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 
-// Global language preference storage (default to "auto-translate" for automatic translation to English)
+// Global language preference storage (default to "auto" to preserve the detected language)
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
-    std::sync::LazyLock::new(|| StdMutex::new("auto-translate".to_string()));
+    std::sync::LazyLock::new(|| StdMutex::new("auto".to_string()));
 
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
@@ -416,6 +417,7 @@ pub fn run() {
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
+        .manage(speaker_sidecar::SpeakerSidecarState::default())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
         .setup(|_app| {
             log::info!("Application setup complete");
@@ -647,6 +649,17 @@ pub fn run() {
             api::api_get_meeting,
             api::api_get_meeting_metadata,
             api::api_get_meeting_transcripts,
+            api::api_export_transcript,
+            api::api_list_speaker_profiles,
+            api::api_create_speaker_profile,
+            api::api_rename_speaker_profile,
+            api::api_identify_meeting_speakers,
+            api::api_assign_speaker_cluster,
+            api::api_assign_speaker_label,
+            api::api_assign_transcript_speaker,
+            speaker_sidecar::api_get_speaker_sidecar_status,
+            speaker_sidecar::api_start_speaker_sidecar,
+            speaker_sidecar::api_stop_speaker_sidecar,
             api::api_save_meeting_title,
             api::api_save_transcript,
             api::open_meeting_folder,
@@ -776,6 +789,15 @@ pub fn run() {
                         log::info!("Cleaning up sidecar...");
                         if let Err(e) = summary::summary_engine::force_shutdown_sidecar().await {
                             log::error!("Failed to force shutdown sidecar: {}", e);
+                        }
+
+                        if let Some(sidecar_state) =
+                            _app_handle.try_state::<speaker_sidecar::SpeakerSidecarState>()
+                        {
+                            log::info!("Cleaning up speaker sidecar...");
+                            if let Err(e) = sidecar_state.shutdown().await {
+                                log::error!("Failed to stop speaker sidecar: {}", e);
+                            }
                         }
                     });
                     log::info!("Application cleanup complete");

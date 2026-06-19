@@ -35,6 +35,49 @@ pub struct Transcript {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
+    pub speaker_profile_id: Option<String>,
+    pub speaker_label: Option<String>,
+    pub speaker_confidence: Option<f64>,
+    pub speaker_confirmed: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SpeakerProfile {
+    pub id: String,
+    pub display_name: String,
+    pub color: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SpeakerVoiceprint {
+    pub id: String,
+    pub speaker_profile_id: String,
+    pub embedding_model: String,
+    pub embedding: Vec<u8>,
+    pub sample_count: i64,
+    pub total_duration: f64,
+    pub source_meeting_id: Option<String>,
+    pub source_cluster_label: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SpeakerTurn {
+    pub id: String,
+    pub meeting_id: String,
+    pub cluster_label: String,
+    pub speaker_profile_id: Option<String>,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub confidence: Option<f64>,
+    pub assignment_source: String,
+    pub confirmed: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

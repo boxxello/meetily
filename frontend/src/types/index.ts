@@ -16,6 +16,10 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  speaker_profile_id?: string;
+  speaker_label?: string;
+  speaker_confidence?: number;
+  speaker_confirmed?: number;
 }
 
 export interface TranscriptUpdate {
@@ -30,6 +34,41 @@ export interface TranscriptUpdate {
   audio_start_time: number; // Seconds from recording start
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
+  speaker_profile_id?: string;
+  speaker_label?: string;
+  speaker_confidence?: number;
+  speaker_confirmed?: number;
+}
+
+export interface SpeakerProfile {
+  id: string;
+  display_name: string;
+  color?: string;
+}
+
+export interface SpeakerTurn {
+  cluster_label: string;
+  speaker_profile_id?: string;
+  speaker_label: string;
+  start_time: number;
+  end_time: number;
+  confidence?: number;
+  confirmed: boolean;
+}
+
+export interface SpeakerIdentificationResult {
+  updated_transcript_count: number;
+  speaker_turn_count: number;
+  speakers: SpeakerTurn[];
+}
+
+export interface SpeakerAssignmentResult {
+  updated_transcript_count: number;
+  updated_turn_count: number;
+  propagated_meeting_count: number;
+  propagated_transcript_count: number;
+  propagation_error_count: number;
+  profile: SpeakerProfile;
 }
 
 export interface Block {
@@ -107,4 +146,8 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  speakerProfileId?: string;
+  speakerLabel?: string;
+  speakerConfidence?: number;
+  speakerConfirmed?: boolean;
 }

@@ -140,6 +140,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   const [selectedLanguage, setSelectedLanguage] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('primaryLanguage');
+      if (saved === 'auto-translate') {
+        localStorage.setItem('primaryLanguage', 'auto');
+        return 'auto';
+      }
       return saved || 'auto';
     }
     return 'auto';

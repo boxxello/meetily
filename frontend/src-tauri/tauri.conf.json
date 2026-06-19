@@ -63,6 +63,8 @@
                         "store:default",
                         "notification:default",
                         "notification:allow-is-permission-granted",
+                        "dialog:default",
+                        "dialog:allow-save",
                         "updater:default",
                         "process:default",
                         {
