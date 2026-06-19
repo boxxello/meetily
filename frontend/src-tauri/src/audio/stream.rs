@@ -13,10 +13,23 @@ use super::capture::{AudioCaptureBackend, get_current_backend};
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
 
+#[cfg(target_os = "linux")]
+const PIPEWIRE_SYSTEM_SAMPLE_RATE: u32 = 48_000;
+#[cfg(target_os = "linux")]
+const PIPEWIRE_SYSTEM_CHANNELS: u16 = 2;
+#[cfg(target_os = "linux")]
+const PIPEWIRE_READ_BUFFER_BYTES: usize = 16_384;
+
 /// Stream backend implementation
 pub enum StreamBackend {
     /// CPAL-based stream (ScreenCaptureKit or default)
     Cpal(Stream),
+    /// PipeWire monitor capture process (Linux system audio)
+    #[cfg(target_os = "linux")]
+    PipeWire {
+        child: Option<std::process::Child>,
+        task: Option<std::thread::JoinHandle<()>>,
+    },
     /// Core Audio direct implementation (macOS only)
     #[cfg(target_os = "macos")]
     CoreAudio {
@@ -87,6 +100,25 @@ impl AudioStream {
             return Self::create_core_audio_stream(device, state, device_type, recording_sender).await;
         }
 
+        #[cfg(target_os = "linux")]
+        if device_type == DeviceType::System {
+            match Self::create_pipewire_system_stream(
+                device.clone(),
+                state.clone(),
+                recording_sender.clone(),
+            )
+            .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    warn!(
+                        "⚠️ PipeWire system audio capture failed for '{}': {}; falling back to CPAL",
+                        device.name, error
+                    );
+                }
+            }
+        }
+
         // Default path: use CPAL
         #[cfg(target_os = "macos")]
         let backend_name = if backend_type == AudioCaptureBackend::ScreenCaptureKit {
@@ -100,6 +132,101 @@ impl AudioStream {
 
         info!("🎵 Stream: Using CPAL backend ({}) for device: {}", backend_name, device.name);
         Self::create_cpal_stream(device, state, device_type, recording_sender).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn create_pipewire_system_stream(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<Self> {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let target = resolve_pipewire_monitor_target(&device.name)?;
+        info!(
+            "🔊 Stream: Using PipeWire monitor capture for '{}' target '{}'",
+            device.name, target
+        );
+
+        let mut child = Command::new("pw-record")
+            .args([
+                "--format",
+                "f32",
+                "--rate",
+                &PIPEWIRE_SYSTEM_SAMPLE_RATE.to_string(),
+                "--channels",
+                &PIPEWIRE_SYSTEM_CHANNELS.to_string(),
+                "--latency",
+                "50ms",
+                "--target",
+                &target,
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn pw-record: {}", e))?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture pw-record stdout"))?;
+
+        let capture = AudioCapture::new(
+            device.clone(),
+            state,
+            PIPEWIRE_SYSTEM_SAMPLE_RATE,
+            PIPEWIRE_SYSTEM_CHANNELS,
+            DeviceType::System,
+            recording_sender,
+        );
+        let device_name = device.name.clone();
+
+        let task = std::thread::spawn(move || {
+            let mut read_buffer = vec![0_u8; PIPEWIRE_READ_BUFFER_BYTES];
+            let mut pending_bytes = Vec::<u8>::new();
+
+            loop {
+                match stdout.read(&mut read_buffer) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => {
+                        pending_bytes.extend_from_slice(&read_buffer[..bytes_read]);
+                        let aligned_len = pending_bytes.len() - (pending_bytes.len() % 4);
+                        if aligned_len == 0 {
+                            continue;
+                        }
+
+                        let samples = pending_bytes[..aligned_len]
+                            .chunks_exact(4)
+                            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                            .collect::<Vec<_>>();
+                        pending_bytes.drain(..aligned_len);
+
+                        if !samples.is_empty() {
+                            capture.process_audio_data(&samples);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "PipeWire system audio reader for '{}' ended with error: {}",
+                            device_name, error
+                        );
+                        break;
+                    }
+                }
+            }
+
+            info!("PipeWire system audio reader ended for '{}'", device_name);
+        });
+
+        Ok(Self {
+            device,
+            backend: StreamBackend::PipeWire {
+                child: Some(child),
+                task: Some(task),
+            },
+        })
     }
 
     /// Create a CPAL-based stream (ScreenCaptureKit on macOS)
@@ -331,6 +458,20 @@ impl AudioStream {
                 info!("Stream paused, now dropping to release callbacks");
                 drop(stream);
             }
+            #[cfg(target_os = "linux")]
+            StreamBackend::PipeWire { mut child, task } => {
+                if let Some(child) = child.as_mut() {
+                    if let Err(error) = child.kill() {
+                        warn!("Failed to kill PipeWire capture process: {}", error);
+                    }
+                    let _ = child.wait();
+                }
+
+                if let Some(task_handle) = task {
+                    let _ = task_handle.join();
+                }
+                info!("PipeWire system audio capture stopped");
+            }
             #[cfg(target_os = "macos")]
             StreamBackend::CoreAudio { task } => {
                 // Abort the processing task and wait briefly for cleanup
@@ -350,6 +491,47 @@ impl AudioStream {
         info!("Audio stream stopped and device reference dropped");
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_pipewire_monitor_target(device_name: &str) -> Result<String> {
+    if let Ok(target) = std::env::var("MEETILY_PIPEWIRE_MONITOR_TARGET") {
+        let target = target.trim();
+        if !target.is_empty() {
+            return Ok(target.to_string());
+        }
+    }
+
+    let cleaned = device_name
+        .trim()
+        .strip_suffix(" (System Audio)")
+        .unwrap_or(device_name.trim())
+        .trim();
+
+    if cleaned.ends_with(".monitor") {
+        return Ok(cleaned.to_string());
+    }
+
+    if cleaned.starts_with("alsa_output.") {
+        return Ok(format!("{}.monitor", cleaned));
+    }
+
+    let output = std::process::Command::new("pactl")
+        .arg("get-default-sink")
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run pactl get-default-sink: {}", e))?;
+
+    if output.status.success() {
+        let sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !sink.is_empty() {
+            return Ok(format!("{}.monitor", sink));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Could not resolve PipeWire monitor target for '{}'",
+        device_name
+    ))
 }
 
 /// Audio stream manager for handling multiple streams
@@ -479,5 +661,30 @@ impl Drop for AudioStreamManager {
         if let Err(e) = self.stop_streams() {
             error!("Error stopping streams during drop: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use super::resolve_pipewire_monitor_target;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipewire_monitor_resolver_accepts_source_name() {
+        let target =
+            resolve_pipewire_monitor_target("alsa_output.test-device.stereo.monitor (System Audio)")
+                .expect("monitor source target");
+
+        assert_eq!(target, "alsa_output.test-device.stereo.monitor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipewire_monitor_resolver_derives_monitor_from_sink_name() {
+        let target = resolve_pipewire_monitor_target("alsa_output.test-device.stereo")
+            .expect("sink monitor target");
+
+        assert_eq!(target, "alsa_output.test-device.stereo.monitor");
     }
 }

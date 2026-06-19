@@ -6,9 +6,20 @@ import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
 import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuLabel,
+    DropdownMenuSeparator,
+    DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
+import { Input } from "./ui/input";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
-import { TranscriptSegmentData } from "@/types";
+import { invoke } from "@tauri-apps/api/core";
+import { toast } from "sonner";
+import { SpeakerAssignmentResult, SpeakerProfile, TranscriptSegmentData } from "@/types";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -34,6 +45,8 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+    meetingId?: string;
+    onSpeakerAssigned?: () => Promise<void>;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -63,21 +76,260 @@ function cleanStopWords(text: string): string {
     return cleanedText.replace(/\s+/g, ' ').trim();
 }
 
+function speakerBadgeClass(label: string, confirmed?: boolean): string {
+    if (confirmed) {
+        return "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100";
+    }
+
+    if (label.startsWith("Maybe ")) {
+        return "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100";
+    }
+
+    return "border-gray-200 bg-gray-50 text-gray-600 hover:bg-gray-100";
+}
+
+function suggestedSpeakerName(label: string): string {
+    if (label.startsWith("Maybe ")) {
+        return label.replace(/^Maybe\s+/, "");
+    }
+
+    return label.startsWith("Speaker ") ? "" : label;
+}
+
+function SpeakerLabelMenu({
+    meetingId,
+    speakerProfileId,
+    speakerLabel,
+    speakerConfirmed,
+    onAssigned,
+}: {
+    meetingId?: string;
+    speakerProfileId?: string;
+    speakerLabel: string;
+    speakerConfirmed?: boolean;
+    onAssigned?: () => Promise<void>;
+}) {
+    const [profiles, setProfiles] = useState<SpeakerProfile[]>([]);
+    const [loadingProfiles, setLoadingProfiles] = useState(false);
+    const [assigning, setAssigning] = useState(false);
+    const [open, setOpen] = useState(false);
+    const [speakerName, setSpeakerName] = useState(suggestedSpeakerName(speakerLabel));
+
+    const canAssign = Boolean(meetingId);
+
+    useEffect(() => {
+        setSpeakerName(suggestedSpeakerName(speakerLabel));
+    }, [speakerLabel]);
+
+    const loadProfiles = useCallback(async () => {
+        if (!canAssign || loadingProfiles) return;
+
+        setLoadingProfiles(true);
+        try {
+            const existing = await invoke<SpeakerProfile[]>('api_list_speaker_profiles');
+            setProfiles(existing);
+        } catch (error) {
+            toast.error('Failed to load speaker profiles', {
+                description: error instanceof Error ? error.message : String(error),
+            });
+        } finally {
+            setLoadingProfiles(false);
+        }
+    }, [canAssign, loadingProfiles]);
+
+    const assignProfile = useCallback(async (profile: SpeakerProfile) => {
+        if (!meetingId) return;
+
+        setAssigning(true);
+        try {
+            const result = await invoke<SpeakerAssignmentResult>('api_assign_speaker_label', {
+                meetingId,
+                speakerLabel,
+                profileId: profile.id,
+                learnVoiceprint: true,
+            });
+
+            if (onAssigned) {
+                await onAssigned();
+            }
+
+            const propagationDetail = result.propagated_transcript_count > 0
+                ? `; ${result.propagated_transcript_count} older segments relabeled`
+                : '';
+
+            toast.success(`Assigned ${profile.display_name}`, {
+                description: `${result.updated_transcript_count} transcript segments updated${propagationDetail}`,
+            });
+            setOpen(false);
+        } catch (error) {
+            toast.error('Speaker assignment failed', {
+                description: error instanceof Error ? error.message : String(error),
+                duration: 7000,
+            });
+        } finally {
+            setAssigning(false);
+        }
+    }, [meetingId, onAssigned, speakerLabel]);
+
+    const createAndAssignProfile = useCallback(async () => {
+        const displayName = speakerName.trim();
+        if (!displayName) return;
+
+        setAssigning(true);
+        try {
+            const profile = await invoke<SpeakerProfile>('api_create_speaker_profile', {
+                displayName,
+                color: null,
+            });
+            await assignProfile(profile);
+        } catch (error) {
+            toast.error('Speaker profile creation failed', {
+                description: error instanceof Error ? error.message : String(error),
+                duration: 7000,
+            });
+        } finally {
+            setAssigning(false);
+        }
+    }, [assignProfile, speakerName]);
+
+    const renameCurrentProfile = useCallback(async () => {
+        if (!speakerProfileId) return;
+
+        const displayName = speakerName.trim();
+        if (!displayName) return;
+
+        setAssigning(true);
+        try {
+            const profile = await invoke<SpeakerProfile>('api_rename_speaker_profile', {
+                profileId: speakerProfileId,
+                displayName,
+            });
+            setProfiles((current) => current.map((item) => item.id === profile.id ? profile : item));
+
+            if (onAssigned) {
+                await onAssigned();
+            }
+
+            toast.success(`Renamed speaker to ${profile.display_name}`);
+            setOpen(false);
+        } catch (error) {
+            toast.error('Speaker rename failed', {
+                description: error instanceof Error ? error.message : String(error),
+                duration: 7000,
+            });
+        } finally {
+            setAssigning(false);
+        }
+    }, [onAssigned, speakerName, speakerProfileId]);
+
+    if (!canAssign) {
+        return (
+            <span className={`inline-flex max-w-full items-center rounded border px-1.5 py-0.5 text-[11px] font-medium ${speakerBadgeClass(speakerLabel, speakerConfirmed)}`}>
+                <span className="truncate">{speakerLabel}</span>
+            </span>
+        );
+    }
+
+    return (
+        <DropdownMenu open={open} onOpenChange={(nextOpen) => {
+            setOpen(nextOpen);
+            if (nextOpen) {
+                loadProfiles();
+                setSpeakerName(suggestedSpeakerName(speakerLabel));
+            }
+        }}>
+            <DropdownMenuTrigger asChild>
+                <button
+                    type="button"
+                    className={`inline-flex max-w-full items-center rounded border px-1.5 py-0.5 text-left text-[11px] font-medium ${speakerBadgeClass(speakerLabel, speakerConfirmed)}`}
+                    disabled={assigning}
+                    title="Assign speaker name"
+                >
+                    <span className="truncate">{assigning ? 'Assigning...' : speakerLabel}</span>
+                </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-64">
+                <DropdownMenuLabel className="text-xs text-gray-500">
+                    {speakerProfileId ? 'Speaker profile' : 'Name this speaker'}
+                </DropdownMenuLabel>
+                <div className="px-2 pb-2" onKeyDown={(event) => event.stopPropagation()}>
+                    <Input
+                        value={speakerName}
+                        onChange={(event) => setSpeakerName(event.target.value)}
+                        placeholder="Speaker name"
+                        disabled={assigning}
+                        className="h-8 text-sm"
+                    />
+                    <div className="mt-2 flex gap-2">
+                        {speakerProfileId ? (
+                            <button
+                                type="button"
+                                className="rounded border border-gray-200 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                onClick={renameCurrentProfile}
+                                disabled={assigning || speakerName.trim().length === 0}
+                            >
+                                Rename
+                            </button>
+                        ) : (
+                            <button
+                                type="button"
+                                className="rounded border border-gray-200 px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                onClick={createAndAssignProfile}
+                                disabled={assigning || speakerName.trim().length === 0}
+                            >
+                                Save as speaker
+                            </button>
+                        )}
+                    </div>
+                </div>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-xs text-gray-500">
+                    Assign existing
+                </DropdownMenuLabel>
+                {profiles.length > 0 ? (
+                    profiles.map((profile) => (
+                        <DropdownMenuItem
+                            key={profile.id}
+                            onClick={() => assignProfile(profile)}
+                        >
+                            {profile.display_name}
+                        </DropdownMenuItem>
+                    ))
+                ) : (
+                    <DropdownMenuItem disabled>
+                        {loadingProfiles ? 'Loading speakers...' : 'No saved speakers'}
+                    </DropdownMenuItem>
+                )}
+            </DropdownMenuContent>
+        </DropdownMenu>
+    );
+}
+
 // Memoized transcript segment component
 const TranscriptSegment = memo(function TranscriptSegment({
     id,
     timestamp,
     text,
     confidence,
+    speakerProfileId,
+    speakerLabel,
+    speakerConfirmed,
     isStreaming,
     showConfidence,
+    meetingId,
+    onSpeakerAssigned,
 }: {
     id: string;
     timestamp: number;
     text: string;
     confidence?: number;
+    speakerProfileId?: string;
+    speakerLabel?: string;
+    speakerConfirmed?: boolean;
     isStreaming: boolean;
     showConfidence: boolean;
+    meetingId?: string;
+    onSpeakerAssigned?: () => Promise<void>;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -96,7 +348,18 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         )}
                     </TooltipContent>
                 </Tooltip>
-                <div className="flex-1">
+                <div className="min-w-0 flex-1">
+                    {speakerLabel && (
+                        <div className="mb-1 max-w-full">
+                            <SpeakerLabelMenu
+                                meetingId={meetingId}
+                                speakerProfileId={speakerProfileId}
+                                speakerLabel={speakerLabel}
+                                speakerConfirmed={speakerConfirmed}
+                                onAssigned={onSpeakerAssigned}
+                            />
+                        </div>
+                    )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -124,6 +387,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    meetingId,
+    onSpeakerAssigned,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -294,8 +559,13 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speakerProfileId={segment.speakerProfileId}
+                                        speakerLabel={segment.speakerLabel}
+                                        speakerConfirmed={segment.speakerConfirmed}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        meetingId={meetingId}
+                                        onSpeakerAssigned={onSpeakerAssigned}
                                     />
                                 </div>
                             );
@@ -350,8 +620,13 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speakerProfileId={segment.speakerProfileId}
+                                        speakerLabel={segment.speakerLabel}
+                                        speakerConfirmed={segment.speakerConfirmed}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        meetingId={meetingId}
+                                        onSpeakerAssigned={onSpeakerAssigned}
                                     />
                                 </motion.div>
                             );

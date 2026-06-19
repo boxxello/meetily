@@ -29,6 +29,7 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    last_recording_duration: Option<f64>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -49,6 +50,7 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            last_recording_duration: None,
         }
     }
 
@@ -67,6 +69,7 @@ impl RecordingManager {
         auto_save: bool,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+        self.last_recording_duration = None;
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -254,6 +257,8 @@ impl RecordingManager {
     /// Stop streams and force immediate pipeline flush to process all accumulated audio
     pub async fn stop_streams_and_force_flush(&mut self) -> Result<()> {
         info!("🚀 Stopping recording streams with IMMEDIATE pipeline flush");
+        self.last_recording_duration = self.state.get_active_recording_duration();
+        info!("Recording duration captured before cleanup: {:?}s", self.last_recording_duration);
 
         // CRITICAL: Stop device monitor FIRST to prevent continuous WASAPI polling on Windows
         // This fixes the slow shutdown issue where device enumeration runs for 90+ seconds
@@ -288,9 +293,13 @@ impl RecordingManager {
     pub async fn save_recording_only<R: tauri::Runtime>(&mut self, app: &tauri::AppHandle<R>) -> Result<()> {
         debug!("Saving recording with transcript chunks");
 
-        // Get actual recording duration from state
-        let recording_duration = self.state.get_active_recording_duration();
-        info!("Recording duration from state: {:?}s", recording_duration);
+        // Cleanup releases devices before this save path runs, so preserve the
+        // duration captured at stop time instead of falling back to transcript end.
+        let recording_duration = recording_duration_for_save(
+            self.state.get_active_recording_duration(),
+            self.last_recording_duration,
+        );
+        info!("Recording duration for save: {:?}s", recording_duration);
 
         // Save the recording with actual duration
         match self.recording_saver.stop_and_save(app, recording_duration).await {
@@ -437,6 +446,11 @@ impl RecordingManager {
     /// Add a structured transcript segment to be saved later
     pub fn add_transcript_segment(&self, segment: super::recording_saver::TranscriptSegment) {
         self.recording_saver.add_transcript_segment(segment);
+    }
+
+    /// Add a privacy-safe transcription diagnostic event to be saved later
+    pub fn add_transcription_diagnostic(&self, diagnostic: serde_json::Value) {
+        self.recording_saver.add_transcription_diagnostic(diagnostic);
     }
 
     /// Add a transcript chunk to be saved later (legacy method)
@@ -598,6 +612,25 @@ impl RecordingManager {
     /// Get reference to recording state for external access
     pub fn get_state(&self) -> &Arc<RecordingState> {
         &self.state
+    }
+}
+
+fn recording_duration_for_save(active: Option<f64>, cached: Option<f64>) -> Option<f64> {
+    active.or(cached)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recording_duration_for_save;
+
+    #[test]
+    fn test_recording_duration_for_save_uses_cached_duration_after_cleanup() {
+        assert_eq!(recording_duration_for_save(None, Some(84.02)), Some(84.02));
+    }
+
+    #[test]
+    fn test_recording_duration_for_save_prefers_active_duration() {
+        assert_eq!(recording_duration_for_save(Some(10.0), Some(84.02)), Some(10.0));
     }
 }
 

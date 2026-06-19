@@ -11,6 +11,16 @@ use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
 use super::incremental_saver::IncrementalAudioSaver;
 
+const DIAGNOSTIC_WRITE_INTERVAL_EVENTS: usize = 25;
+const DIAGNOSTIC_IMMEDIATE_EVENTS: &[&str] = &[
+    "model_not_ready_dropped",
+    "audio_too_short_dropped",
+    "model_unloaded_during_transcription",
+    "transcription_error",
+    "asr_retry_error",
+    "asr_empty_retry_dropped",
+];
+
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptSegment {
@@ -22,6 +32,14 @@ pub struct TranscriptSegment {
     pub display_time: String,   // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_confirmed: Option<i64>,
 }
 
 /// Meeting metadata structure
@@ -53,6 +71,8 @@ pub struct RecordingSaver {
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
+    transcription_diagnostics: Arc<Mutex<Vec<serde_json::Value>>>,
+    last_diagnostic_write_count: Arc<Mutex<usize>>,
     chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
 }
@@ -65,6 +85,8 @@ impl RecordingSaver {
             meeting_name: None,
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
+            transcription_diagnostics: Arc::new(Mutex::new(Vec::new())),
+            last_diagnostic_write_count: Arc::new(Mutex::new(0)),
             chunk_receiver: None,
             is_saving: Arc::new(Mutex::new(false)),
         }
@@ -118,6 +140,56 @@ impl RecordingSaver {
         }
     }
 
+    /// Add a privacy-safe transcription diagnostic event.
+    /// These records intentionally contain timing/count/reason metadata only, never transcript text.
+    pub fn add_transcription_diagnostic(&self, mut diagnostic: serde_json::Value) {
+        let event_name = diagnostic
+            .get("event")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if let Some(object) = diagnostic.as_object_mut() {
+            object
+                .entry("created_at")
+                .or_insert_with(|| serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+        }
+
+        let diagnostic_count = if let Ok(mut diagnostics) = self.transcription_diagnostics.lock() {
+            diagnostics.push(diagnostic);
+            diagnostics.len()
+        } else {
+            error!("Failed to lock transcription diagnostics for adding event");
+            return;
+        };
+
+        let should_write = DIAGNOSTIC_IMMEDIATE_EVENTS.contains(&event_name.as_str())
+            || self.should_checkpoint_diagnostics(diagnostic_count);
+
+        if should_write {
+            if let Some(folder) = &self.meeting_folder {
+                if let Err(e) = self.write_transcription_diagnostics_json(folder) {
+                    warn!("Failed to write transcription diagnostic update: {}", e);
+                }
+            }
+        }
+    }
+
+    fn should_checkpoint_diagnostics(&self, diagnostic_count: usize) -> bool {
+        if diagnostic_count == 0 {
+            return false;
+        }
+
+        if let Ok(mut last_count) = self.last_diagnostic_write_count.lock() {
+            if diagnostic_count.saturating_sub(*last_count) >= DIAGNOSTIC_WRITE_INTERVAL_EVENTS {
+                *last_count = diagnostic_count;
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Legacy method for backward compatibility - converts text to basic segment
     pub fn add_transcript_chunk(&self, text: String) {
         let segment = TranscriptSegment {
@@ -129,6 +201,10 @@ impl RecordingSaver {
             display_time: "[00:00]".to_string(),
             confidence: 1.0,
             sequence_id: 0,
+            speaker_profile_id: None,
+            speaker_label: None,
+            speaker_confidence: None,
+            speaker_confirmed: None,
         };
         self.add_transcript_segment(segment);
     }
@@ -172,8 +248,13 @@ impl RecordingSaver {
             }
         }
 
-        // Start accumulation task
-        let is_saving_clone = self.is_saving.clone();
+        // Mark active before spawning so the first chunks cannot race with setup.
+        if let Ok(mut is_saving) = self.is_saving.lock() {
+            *is_saving = true;
+        }
+
+        // Start accumulation task. The sender dropping is the stop signal; do
+        // not break on a flag here or queued tail audio can be discarded.
         let incremental_saver_arc = self.incremental_saver.clone();
         let save_audio = auto_save;
 
@@ -182,17 +263,6 @@ impl RecordingSaver {
                 info!("Recording saver accumulation task started (save_audio: {})", save_audio);
 
                 while let Some(chunk) = receiver.recv().await {
-                    // Check if we should continue
-                    let should_continue = if let Ok(is_saving) = is_saving_clone.lock() {
-                        *is_saving
-                    } else {
-                        false
-                    };
-
-                    if !should_continue {
-                        break;
-                    }
-
                     // Only process audio chunks if auto_save is enabled
                     if save_audio {
                         // Add chunk to incremental saver
@@ -212,11 +282,6 @@ impl RecordingSaver {
 
                 info!("Recording saver accumulation task ended");
             });
-        }
-
-        // Set saving flag
-        if let Ok(mut is_saving) = self.is_saving.lock() {
-            *is_saving = true;
         }
 
         sender
@@ -337,6 +402,42 @@ impl RecordingSaver {
         Ok(())
     }
 
+    /// Write transcription_diagnostics.json to disk.
+    fn write_transcription_diagnostics_json(&self, folder: &PathBuf) -> Result<()> {
+        let diagnostics_clone = if let Ok(diagnostics) = self.transcription_diagnostics.lock() {
+            diagnostics.clone()
+        } else {
+            error!("Failed to lock transcription diagnostics for writing");
+            return Err(anyhow::anyhow!("Failed to lock transcription diagnostics"));
+        };
+
+        let diagnostics_path = folder.join("transcription_diagnostics.json");
+        let temp_path = folder.join(".transcription_diagnostics.json.tmp");
+
+        let json = serde_json::json!({
+            "version": "1.0",
+            "privacy": "no transcript text is stored in this file",
+            "events": diagnostics_clone,
+            "last_updated": chrono::Utc::now().to_rfc3339(),
+            "total_events": diagnostics_clone.len()
+        });
+
+        let json_string = serde_json::to_string_pretty(&json)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {}", e))?;
+
+        std::fs::write(&temp_path, &json_string)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp diagnostics file: {}", e))?;
+
+        std::fs::rename(&temp_path, &diagnostics_path)
+            .map_err(|e| anyhow::anyhow!("Failed to rename diagnostics file: {}", e))?;
+
+        if let Ok(mut last_count) = self.last_diagnostic_write_count.lock() {
+            *last_count = diagnostics_clone.len();
+        }
+
+        Ok(())
+    }
+
     // in frontend/src-tauri/src/audio/recording_saver.rs
     pub fn get_stats(&self) -> (usize, u32) {
         if let Some(ref saver) = self.incremental_saver {
@@ -362,11 +463,6 @@ impl RecordingSaver {
     ) -> Result<Option<String>, String> {
         info!("Stopping recording saver");
 
-        // Stop accumulation
-        if let Ok(mut is_saving) = self.is_saving.lock() {
-            *is_saving = false;
-        }
-
         // Give time for final chunks
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
@@ -376,6 +472,7 @@ impl RecordingSaver {
         if !should_save_audio {
             info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
             info!("✅ Transcripts and metadata already saved incrementally");
+            self.mark_not_saving();
             return Ok(None);
         }
 
@@ -402,6 +499,10 @@ impl RecordingSaver {
             if let Err(e) = self.write_transcripts_json(folder) {
                 error!("❌ Failed to write final transcripts: {}", e);
                 return Err(format!("Failed to save transcripts: {}", e));
+            }
+
+            if let Err(e) = self.write_transcription_diagnostics_json(folder) {
+                warn!("Failed to write final transcription diagnostics: {}", e);
             }
 
             // Verify transcripts were written correctly
@@ -454,8 +555,15 @@ impl RecordingSaver {
         if let Ok(mut segments) = self.transcript_segments.lock() {
             segments.clear();
         }
+        self.mark_not_saving();
 
         Ok(Some(final_audio_path.to_string_lossy().to_string()))
+    }
+
+    fn mark_not_saving(&self) {
+        if let Ok(mut is_saving) = self.is_saving.lock() {
+            *is_saving = false;
+        }
     }
 
     /// Get the meeting folder path (for passing to backend)
@@ -481,5 +589,21 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_checkpoint_policy_writes_every_interval() {
+        let saver = RecordingSaver::new();
+
+        assert!(!saver.should_checkpoint_diagnostics(1));
+        assert!(!saver.should_checkpoint_diagnostics(DIAGNOSTIC_WRITE_INTERVAL_EVENTS - 1));
+        assert!(saver.should_checkpoint_diagnostics(DIAGNOSTIC_WRITE_INTERVAL_EVENTS));
+        assert!(!saver.should_checkpoint_diagnostics(DIAGNOSTIC_WRITE_INTERVAL_EVENTS + 1));
+        assert!(saver.should_checkpoint_diagnostics(DIAGNOSTIC_WRITE_INTERVAL_EVENTS * 2));
     }
 }

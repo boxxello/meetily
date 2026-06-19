@@ -61,6 +61,10 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      speakerProfileId: t.speaker_profile_id,
+      speakerLabel: t.speaker_label,
+      speakerConfidence: t.speaker_confidence,
+      speakerConfirmed: t.speaker_confirmed === 1,
     }));
   }, [transcripts, usePagination, segments]);
 
@@ -75,6 +79,7 @@ export function TranscriptPanel({
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
+          isRecording={isRecording}
         />
       </div>
 
@@ -94,6 +99,8 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          meetingId={meetingId}
+          onSpeakerAssigned={onRefetchTranscripts}
         />
       </div>
 
