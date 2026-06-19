@@ -102,15 +102,27 @@ impl SpeakerTurnRepository {
         meeting_id: &str,
         turns: &[SpeakerTurnAssignment],
     ) -> Result<u64, SqlxError> {
-        let transcripts: Vec<(String, Option<f64>, Option<f64>)> = sqlx::query_as(
-            "SELECT id, audio_start_time, audio_end_time FROM transcripts WHERE meeting_id = ?",
+        // Run all reads and writes in one transaction so a meeting is never
+        // left half-assigned if an update fails partway through the loop.
+        let mut tx = pool.begin().await?;
+
+        let transcripts: Vec<(String, Option<f64>, Option<f64>, Option<i64>)> = sqlx::query_as(
+            "SELECT id, audio_start_time, audio_end_time, speaker_confirmed FROM transcripts WHERE meeting_id = ?",
         )
         .bind(meeting_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut updated = 0_u64;
-        for (transcript_id, start, end) in transcripts {
+        for (transcript_id, start, end, confirmed) in transcripts {
+            // Never overwrite a speaker the user manually confirmed. Manual
+            // confirmation sets transcripts.speaker_confirmed=1 directly (with
+            // no speaker_turns row), so automatic overlap propagation must skip
+            // these rows or it would silently destroy user-confirmed labels.
+            if confirmed.unwrap_or(0) == 1 {
+                continue;
+            }
+
             let (Some(start), Some(end)) = (start, end) else {
                 continue;
             };
@@ -132,11 +144,13 @@ impl SpeakerTurnRepository {
             .bind(turn.confidence)
             .bind(if turn.confirmed { 1_i64 } else { 0_i64 })
             .bind(&transcript_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
 
             updated += result.rows_affected();
         }
+
+        tx.commit().await?;
 
         Ok(updated)
     }

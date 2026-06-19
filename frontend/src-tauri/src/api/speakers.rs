@@ -1102,6 +1102,53 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn overlap_assignment_never_overwrites_user_confirmed_transcript() {
+        let pool = speaker_test_pool().await;
+        insert_profile(&pool, "profile-auto", "Alice").await;
+        insert_profile(&pool, "profile-manual", "Bob").await;
+
+        // A transcript the user manually confirmed as "Bob" (speaker_confirmed = 1,
+        // with no speaker_turns row — exactly how api_assign_transcript_speaker writes it).
+        sqlx::query(
+            "INSERT INTO transcripts
+             (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time,
+              speaker_profile_id, speaker_label, speaker_confidence, speaker_confirmed)
+             VALUES ('transcript-confirmed', 'meeting-1', '[redacted test text]', '00:00',
+                     1.0, 3.0, 'profile-manual', 'Bob', NULL, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // An automatic recognition turn overlapping the same range, pointing elsewhere.
+        let assignments = vec![SpeakerTurnAssignment {
+            cluster_label: "SPEAKER_00".to_string(),
+            speaker_profile_id: Some("profile-auto".to_string()),
+            speaker_label: "Alice".to_string(),
+            start_time: 0.0,
+            end_time: 5.0,
+            confidence: Some(0.9),
+            confirmed: false,
+            assignment_source: "recognition".to_string(),
+        }];
+
+        let updated =
+            SpeakerTurnRepository::assign_transcripts_by_overlap(&pool, "meeting-1", &assignments)
+                .await
+                .unwrap();
+
+        // The user-confirmed assignment must survive untouched.
+        assert_eq!(updated, 0, "confirmed transcript must not be overwritten");
+        assert_transcript_speaker(
+            &pool,
+            "transcript-confirmed",
+            Some("profile-manual"),
+            Some("Bob"),
+        )
+        .await;
+    }
+
     async fn speaker_test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

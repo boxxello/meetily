@@ -92,10 +92,14 @@ pub async fn api_export_transcript<R: Runtime>(
 }
 
 fn format_timestamp(seconds: f64) -> String {
-    let total_ms = (seconds * 1000.0).round() as u64;
-    let hrs = total_ms / 3_600_000;
-    let mins = (total_ms % 3_600_000) / 60_000;
-    let secs = (total_ms % 60_000) as f64 / 1000.0;
+    // Round to centiseconds (the display precision) BEFORE splitting into
+    // h/m/s. Rounding after the split lets a value like 59.996s render as the
+    // invalid ":60.00" because the {:.2} display rounds the seconds field up
+    // without carrying into minutes. Carrying here keeps every field in range.
+    let total_cs = (seconds.max(0.0) * 100.0).round() as u64;
+    let hrs = total_cs / 360_000;
+    let mins = (total_cs % 360_000) / 6_000;
+    let secs = (total_cs % 6_000) as f64 / 100.0;
     format!("{:02}:{:02}:{:05.2}", hrs, mins, secs)
 }
 
@@ -110,14 +114,28 @@ pub fn format_txt(transcripts: &[MeetingTranscript]) -> String {
     let mut output = String::new();
     for t in sorted {
         let text = t.text.replace('\n', " ").replace('\r', "");
+        let body = match speaker_display_label(t) {
+            Some(label) => format!("{}: {}", label, text),
+            None => text,
+        };
         if let Some(start) = t.audio_start_time {
-            output.push_str(&format!("[{}] {}\n", format_timestamp(start), text));
+            output.push_str(&format!("[{}] {}\n", format_timestamp(start), body));
         } else {
-            output.push_str(&text);
+            output.push_str(&body);
             output.push('\n');
         }
     }
     output
+}
+
+/// Returns the human-facing speaker label for a transcript segment, if one was
+/// assigned and is non-empty. Used to surface diarized/identified speakers in
+/// exported transcripts.
+fn speaker_display_label(t: &MeetingTranscript) -> Option<&str> {
+    t.speaker_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 pub fn format_vtt(transcripts: &[MeetingTranscript]) -> (String, usize) {
@@ -144,17 +162,32 @@ pub fn format_vtt(transcripts: &[MeetingTranscript]) -> (String, usize) {
             .or_else(|| t.duration.map(|d| start + d))
             .unwrap_or(start + 5.0);
 
+        // Escape VTT markup, and collapse newlines: a blank line inside cue
+        // text terminates the cue, corrupting/truncating it for parsers.
         let text = t
             .text
             .replace('&', "&amp;")
             .replace('<', "&lt;")
-            .replace('>', "&gt;");
+            .replace('>', "&gt;")
+            .replace('\r', "")
+            .replace('\n', " ");
+
+        let cue_body = match speaker_display_label(t) {
+            Some(label) => {
+                let voice = label
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                format!("<v {}>{}", voice, text)
+            }
+            None => text,
+        };
 
         output.push_str(&format!(
             "{} --> {}\n{}\n\n",
             format_timestamp(start),
             format_timestamp(end),
-            text
+            cue_body
         ));
     }
 
@@ -321,6 +354,51 @@ mod tests {
         let (result, skipped) = format_vtt(&[]);
         assert_eq!(skipped, 0);
         assert_eq!(result, "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn test_timestamp_minute_boundary_never_emits_sixty() {
+        // Regression: values just under a minute boundary must carry, not render ":60.00".
+        assert_eq!(format_timestamp(59.996), "00:01:00.00");
+        assert_eq!(format_timestamp(119.998), "00:02:00.00");
+        assert_eq!(format_timestamp(3599.999), "01:00:00.00");
+        // Normal values unaffected.
+        assert_eq!(format_timestamp(10.0), "00:00:10.00");
+        assert_eq!(format_timestamp(59.99), "00:00:59.99");
+        assert_eq!(format_timestamp(0.0), "00:00:00.00");
+    }
+
+    #[test]
+    fn test_txt_speaker_label_prefixed() {
+        let mut s = seg("Hello world", Some(1.0), None, None);
+        s.speaker_label = Some("Alice".to_string());
+        let result = format_txt(&[s]);
+        assert_eq!(result, "[00:00:01.00] Alice: Hello world\n");
+    }
+
+    #[test]
+    fn test_txt_blank_speaker_label_ignored() {
+        let mut s = seg("Hi", Some(1.0), None, None);
+        s.speaker_label = Some("   ".to_string());
+        let result = format_txt(&[s]);
+        assert_eq!(result, "[00:00:01.00] Hi\n");
+    }
+
+    #[test]
+    fn test_vtt_speaker_voice_tag() {
+        let mut s = seg("Hello", Some(1.0), Some(3.0), None);
+        s.speaker_label = Some("Alice".to_string());
+        let (result, _) = format_vtt(&[s]);
+        assert!(result.contains("00:00:01.00 --> 00:00:03.00\n<v Alice>Hello"));
+    }
+
+    #[test]
+    fn test_vtt_cue_newlines_collapsed() {
+        // A blank line inside cue text would otherwise terminate the cue.
+        let s = seg("Line1\n\nLine2", Some(1.0), Some(2.0), None);
+        let (result, _) = format_vtt(&[s]);
+        assert!(!result.contains("Line1\n\nLine2"));
+        assert!(result.contains("Line1  Line2") || result.contains("Line1 Line2"));
     }
 
     #[test]
