@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,18 @@ from typing import Any
 from .audio import prepare_audio_for_ml
 
 logger = logging.getLogger(__name__)
+
+# Long-audio handling. pyannote's clustering builds an O(windows^2) affinity
+# matrix, so a multi-hour recording becomes pathologically slow (a 7h file can
+# run for hours). Above the threshold we diarize in bounded windows; each
+# window's clustering stays small. Per-window clusters are labelled uniquely
+# ("SPEAKER_00@c3") and reconciled to enrolled profiles downstream by the
+# embedding/identify step, so enrolled speakers still get consistent names.
+# Tunable via env; set CHUNK_SECONDS<=0 to force single-pass (legacy) behaviour.
+_CHUNK_SECONDS = float(os.getenv("MEETILY_DIARIZATION_CHUNK_SECONDS", "1500"))  # 25 min
+_CHUNK_THRESHOLD_SECONDS = float(
+    os.getenv("MEETILY_DIARIZATION_CHUNK_THRESHOLD_SECONDS", "1800")  # only chunk if >30 min
+)
 
 
 @dataclass(frozen=True)
@@ -75,25 +88,75 @@ class DiarizationService:
         if max_speakers is not None:
             kwargs["max_speakers"] = max_speakers
 
-        output = pipeline(str(prepared_path), **kwargs)
+        import torch
+        import torchaudio
+
+        waveform, sample_rate = torchaudio.load(str(prepared_path))
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        total_seconds = waveform.shape[-1] / float(sample_rate)
+
+        if _CHUNK_SECONDS <= 0 or total_seconds <= _CHUNK_THRESHOLD_SECONDS:
+            # Short recording: single pass over the whole file (best quality).
+            turns = self._diarize_window(
+                pipeline, {"waveform": waveform, "sample_rate": sample_rate}, kwargs, 0.0, ""
+            )
+        else:
+            logger.warning(
+                "Diarizing long audio (%.1f min) in %.0f-min chunks to bound clustering cost; "
+                "unenrolled speakers may be labelled per chunk.",
+                total_seconds / 60.0,
+                _CHUNK_SECONDS / 60.0,
+            )
+            turns = []
+            chunk_index = 0
+            start_seconds = 0.0
+            while start_seconds < total_seconds:
+                end_seconds = min(total_seconds, start_seconds + _CHUNK_SECONDS)
+                s_frame = int(start_seconds * sample_rate)
+                e_frame = int(end_seconds * sample_rate)
+                chunk_waveform = waveform[:, s_frame:e_frame]
+                turns.extend(
+                    self._diarize_window(
+                        pipeline,
+                        {"waveform": chunk_waveform, "sample_rate": sample_rate},
+                        kwargs,
+                        start_seconds,
+                        f"@c{chunk_index}",
+                    )
+                )
+                chunk_index += 1
+                if end_seconds >= total_seconds:
+                    break
+                start_seconds = end_seconds
+
+        turns.sort(key=lambda turn: (turn.start, turn.end, turn.cluster_label))
+        return turns
+
+    def _diarize_window(
+        self,
+        pipeline: Any,
+        audio_input: Any,
+        kwargs: dict[str, int],
+        offset_seconds: float,
+        label_suffix: str,
+    ) -> list[SpeakerTurn]:
+        output = pipeline(audio_input, **kwargs)
         annotation = (
             getattr(output, "exclusive_speaker_diarization", None)
             or getattr(output, "speaker_diarization", None)
             or output
         )
-
-        turns: list[SpeakerTurn] = []
+        window_turns: list[SpeakerTurn] = []
         for segment, _, label in annotation.itertracks(yield_label=True):
-            turns.append(
+            window_turns.append(
                 SpeakerTurn(
-                    cluster_label=str(label),
-                    start=float(segment.start),
-                    end=float(segment.end),
+                    cluster_label=f"{label}{label_suffix}",
+                    start=float(segment.start) + offset_seconds,
+                    end=float(segment.end) + offset_seconds,
                 )
             )
-
-        turns.sort(key=lambda turn: (turn.start, turn.end, turn.cluster_label))
-        return turns
+        return window_turns
 
 
 def _auth_kwargs(from_pretrained: Any, hf_token: str | None) -> dict[str, str]:
