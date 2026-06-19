@@ -210,19 +210,38 @@ async fn identify_meeting_speakers(
     sidecar.ensure_running().await?;
     let client = sidecar_client()?;
 
-    let diarize = post_sidecar::<_, SidecarDiarizeResponse>(
-        &client,
-        "/diarize",
-        &SidecarDiarizeRequest {
-            audio_path: audio_path.clone(),
-            num_speakers: None,
-            min_speakers: None,
-            max_speakers: None,
-        },
-    )
-    .await?;
+    // Reuse the meeting's existing diarization if we already have it. Diarization
+    // is deterministic for a given recording and is the dominant cost (~20-40s),
+    // so re-running it on every identification — especially during cross-meeting
+    // propagation — wastes minutes. Only call /diarize when no turns exist yet.
+    let stored_turns = SpeakerTurnRepository::list_meeting_turns(pool, meeting_id)
+        .await
+        .unwrap_or_default();
+    let turns: Vec<SidecarTurn> = if !stored_turns.is_empty() {
+        stored_turns
+            .iter()
+            .map(|t| SidecarTurn {
+                cluster_label: t.cluster_label.clone(),
+                start: t.start_time,
+                end: t.end_time,
+            })
+            .collect()
+    } else {
+        post_sidecar::<_, SidecarDiarizeResponse>(
+            &client,
+            "/diarize",
+            &SidecarDiarizeRequest {
+                audio_path: audio_path.clone(),
+                num_speakers: None,
+                min_speakers: None,
+                max_speakers: None,
+            },
+        )
+        .await?
+        .turns
+    };
 
-    if diarize.turns.is_empty() {
+    if turns.is_empty() {
         return Ok(SpeakerIdentificationResult {
             updated_transcript_count: 0,
             speaker_turn_count: 0,
@@ -263,7 +282,7 @@ async fn identify_meeting_speakers(
             "/identify",
             &SidecarIdentifyRequest {
                 audio_path: audio_path.clone(),
-                turns: diarize.turns.clone(),
+                turns: turns.clone(),
                 profiles: sidecar_profiles,
                 threshold: DEFAULT_RECOGNITION_THRESHOLD,
                 ambiguity_margin: DEFAULT_AMBIGUITY_MARGIN,
@@ -278,8 +297,7 @@ async fn identify_meeting_speakers(
         .map(|item| (item.cluster_label.clone(), item))
         .collect::<HashMap<_, _>>();
 
-    let assignments = diarize
-        .turns
+    let assignments = turns
         .iter()
         .map(|turn| {
             let cluster_match = match_by_cluster.get(&turn.cluster_label);

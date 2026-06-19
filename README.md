@@ -125,8 +125,8 @@ Build from source following our detailed guides:
 **Quick start:**
 
 ```bash
-git clone https://github.com/Zackriya-Solutions/meeting-minutes
-cd meeting-minutes/frontend
+git clone -b staging/boxxello-fork https://github.com/boxxello/meetily
+cd meetily/frontend
 pnpm install
 ./build-gpu.sh
 ```
