@@ -14,8 +14,18 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use tracing::warn;
 
 const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8179";
-const DEFAULT_RECOGNITION_THRESHOLD: f64 = 0.72;
+// ECAPA cosine threshold for accepting a speaker match. Empirically, a true
+// same-speaker pair across two recordings scores ~0.73 while different speakers
+// score <=~0.21, so 0.72 sat right on the same-speaker boundary and rejected
+// legitimate matches as "unknown". 0.5 sits in the safe gap (well above the
+// inter-speaker ceiling, well below same-speaker). Tunable via the sidecar's
+// SPEAKER_RECOGNITION_THRESHOLD env var. TODO: calibrate on real meeting audio.
+const DEFAULT_RECOGNITION_THRESHOLD: f64 = 0.5;
 const DEFAULT_AMBIGUITY_MARGIN: f64 = 0.05;
+// Upper bound on how many other meetings a single speaker assignment will
+// re-identify (each re-runs diarization, ~20-40s). Without this, one click
+// fans out across the entire meeting history and blocks for minutes/hours.
+const MAX_PROPAGATION_MEETINGS: usize = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeakerProfileDto {
@@ -350,6 +360,7 @@ async fn propagate_speaker_recognition_to_other_meetings(
     };
 
     let mut summary = SpeakerPropagationSummary::default();
+    let mut attempted = 0usize;
     for (meeting_id, folder_path, confirmed_turn_count) in candidates {
         if !should_propagate_to_meeting(
             &meeting_id,
@@ -359,6 +370,17 @@ async fn propagate_speaker_recognition_to_other_meetings(
         ) {
             continue;
         }
+
+        if attempted >= MAX_PROPAGATION_MEETINGS {
+            warn!(
+                "Speaker propagation capped at {} meetings; remaining eligible meetings were not \
+                 auto-identified to avoid a long synchronous re-diarization. Re-run identification \
+                 on them individually if needed.",
+                MAX_PROPAGATION_MEETINGS
+            );
+            break;
+        }
+        attempted += 1;
 
         match identify_meeting_speakers(pool, sidecar, &meeting_id).await {
             Ok(result) => {

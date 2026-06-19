@@ -31,7 +31,10 @@ def load_config() -> ServiceConfig:
             "speechbrain/spkrec-ecapa-voxceleb",
         ),
         device=_speaker_device(),
-        recognition_threshold=float(os.getenv("SPEAKER_RECOGNITION_THRESHOLD", "0.72")),
+        # Cosine threshold for accepting a speaker match. Same-speaker pairs
+        # across recordings score ~0.73, different speakers <=~0.21, so 0.72
+        # rejected legitimate matches; 0.5 sits in the safe gap. Override via env.
+        recognition_threshold=float(os.getenv("SPEAKER_RECOGNITION_THRESHOLD", "0.5")),
         ambiguity_margin=float(os.getenv("SPEAKER_AMBIGUITY_MARGIN", "0.05")),
     )
 
