@@ -91,11 +91,16 @@ class EmbeddingService:
 
         prepared_path = prepare_audio_for_ml(audio_path)
         model = self._load_model()
+        # Decode the prepared (mono/16k) file ONCE, then slice each turn in
+        # memory. Previously every turn re-loaded the whole file from disk
+        # (up to max_turns times per cluster), which dominated latency on long
+        # recordings and re-decoded hundreds of MB repeatedly.
+        full_waveform, sample_rate = _load_full_mono_16k(str(prepared_path))
         embeddings = []
         total_duration = 0.0
 
         for turn in candidates:
-            waveform = _load_mono_segment(str(prepared_path), turn.start, turn.end)
+            waveform = _slice_segment(full_waveform, sample_rate, turn.start, turn.end)
             if waveform is None:
                 continue
             embedding = model.encode_batch(waveform, normalize=True)
@@ -215,25 +220,26 @@ def _to_numpy_vector(embedding: Any) -> np.ndarray:
     return np.asarray(embedding, dtype=np.float32).reshape(-1)
 
 
-def _load_mono_segment(audio_path: str, start: float, end: float) -> Any | None:
+def _load_full_mono_16k(audio_path: str) -> tuple[Any, int]:
+    """Decode an audio file once as mono 16k float32. Returns (waveform, sample_rate)."""
     import torch
     import torchaudio
 
+    waveform, sample_rate = torchaudio.load(audio_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sample_rate != 16000:
+        waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+        sample_rate = 16000
+    return waveform.to(dtype=torch.float32), sample_rate
+
+
+def _slice_segment(waveform: Any, sample_rate: int, start: float, end: float) -> Any | None:
+    """Slice [start, end] (seconds) out of an already-decoded mono waveform."""
     if end <= start:
         return None
-
-    waveform, sample_rate = torchaudio.load(audio_path)
     start_frame = max(0, int(start * sample_rate))
     end_frame = min(waveform.shape[-1], int(end * sample_rate))
     if end_frame <= start_frame:
         return None
-
-    segment = waveform[:, start_frame:end_frame]
-    if segment.shape[0] > 1:
-        segment = segment.mean(dim=0, keepdim=True)
-
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        segment = resampler(segment)
-
-    return segment.to(dtype=torch.float32)
+    return waveform[:, start_frame:end_frame]
