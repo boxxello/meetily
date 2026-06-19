@@ -68,6 +68,17 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 
 Meetily is a privacy-first AI meeting assistant that runs entirely on your local machine. It captures your meetings, transcribes them in real-time, and generates summaries, all without sending any data to the cloud. This makes it the perfect solution for professionals and enterprises who need to maintain complete control over their sensitive information.
 
+## 🔱 What this fork adds (boxxello)
+
+This fork builds on upstream Meetily **v0.4.0** and adds **local, person-level speaker recognition** plus supporting features and fixes — all running on-device, no cloud:
+
+- **Speaker recognition.** A local diarization sidecar (pyannote + SpeechBrain) separates *who spoke when*, lets you **enroll a speaker by name**, learns their **voiceprint**, and **recognizes that same person in future meetings**. Unknown diarized speakers are reconciled to known profiles when you confirm an identity.
+- **Long-recording support.** Chunked diarization processes multi-hour meetings in bounded windows, so a long recording completes in minutes instead of hanging (pyannote's clustering otherwise scales ~O(n²) with audio length).
+- **Transcript export.** Export any meeting transcript to **TXT** and **WebVTT (`.vtt`)**, including speaker labels (`Speaker: …` in TXT, `<v Speaker>` voice tags in VTT).
+- **Reliability & speed fixes.** Manually-confirmed speaker labels are never overwritten by automatic recognition; VTT timestamps are always valid; and recognition is faster (tuned match threshold, decode-audio-once embedding, reuse of stored diarization, and a cap on cross-meeting propagation).
+
+Optional tuning (env vars): `SPEAKER_RECOGNITION_THRESHOLD` (default `0.5`), `MEETILY_DIARIZATION_CHUNK_SECONDS` (default `1500`), `MEETILY_DIARIZATION_CHUNK_THRESHOLD_SECONDS` (default `1800`). Speaker recognition requires the local sidecar under `backend/diarization_service` (see its README).
+
 ## Why Meetily?
 
 While there are many meeting transcription tools available, this solution stands out by offering:
